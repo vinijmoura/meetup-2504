@@ -1,0 +1,117 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  IMAGE_NAME: meetupapi
+  CONTAINER_APP_NAME: meetup2504-app
+  RESOURCE_GROUP: meetup-2504-rg
+
+jobs:
+  # ─────────────────────────────────────────────
+  # Job 1: .NET Build & Test
+  # Runs on every push and pull request
+  # ─────────────────────────────────────────────
+  test:
+    name: Build & Test (.NET)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore meetup-2504.slnx
+
+      - name: Build solution
+        run: dotnet build meetup-2504.slnx --no-restore --configuration Release
+
+      - name: Run unit & integration tests
+        run: dotnet test meetup-2504.slnx --no-build --configuration Release --verbosity normal
+
+  # ─────────────────────────────────────────────
+  # Job 2: Docker Build (+ Push to ACR on main)
+  # On PRs: only builds to validate the Dockerfile
+  # On main: builds, tags, and pushes to ACR
+  # ─────────────────────────────────────────────
+  docker:
+    name: Docker Build & Push
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: meta
+        run: echo "tag=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        run: docker build -t ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }} .
+
+      # The steps below run only when merging/pushing to main
+      - name: Login to Azure
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to Azure Container Registry
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: az acr login --name ${{ secrets.ACR_NAME }}
+
+      - name: Tag & Push image to ACR
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          FULL_TAG="${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}"
+          LATEST_TAG="${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest"
+
+          docker tag ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }} "$FULL_TAG"
+          docker tag ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }} "$LATEST_TAG"
+
+          docker push "$FULL_TAG"
+          docker push "$LATEST_TAG"
+
+  # ─────────────────────────────────────────────
+  # Job 3: Deploy to Azure Container Apps
+  # Runs only after a successful push to main
+  # ─────────────────────────────────────────────
+  deploy:
+    name: Deploy to Azure Container Apps
+    runs-on: ubuntu-latest
+    needs: docker
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Update Container App with new image
+        run: |
+          az containerapp update \
+            --name "${{ env.CONTAINER_APP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --image "${{ secrets.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ needs.docker.outputs.image-tag }}"
+
+      - name: Show Container App URL
+        run: |
+          az containerapp show \
+            --name "${{ env.CONTAINER_APP_NAME }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --query "properties.configuration.ingress.fqdn" \
+            --output tsv
