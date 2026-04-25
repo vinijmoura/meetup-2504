@@ -30,7 +30,10 @@ resource "azurerm_container_registry" "acr" {
   resource_group_name = azurerm_resource_group.rg.name
   location            = azurerm_resource_group.rg.location
   sku                 = "Basic"
-  admin_enabled       = true
+  # admin_enabled is required for Basic SKU since managed identity pull
+  # requires Standard/Premium SKU. For production, upgrade to Standard SKU
+  # and use managed identity (azurerm_container_registry_scope_map).
+  admin_enabled = true
 }
 
 # ─────────────────────────────────────────────
@@ -82,7 +85,7 @@ resource "azurerm_container_app" "app" {
       memory = "0.5Gi"
     }
 
-    min_replicas = 0
+    min_replicas = 0  # Scale to zero when idle to reduce costs (cold-start tradeoff)
     max_replicas = 3
   }
 
